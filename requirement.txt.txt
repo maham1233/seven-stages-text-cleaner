@@ -1,0 +1,5 @@
+streamlit
+trafilatura
+datasketch
+fasttext
+PyMuPDF

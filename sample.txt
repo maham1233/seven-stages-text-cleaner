@@ -1,0 +1,5 @@
+machine learning is amazing
+we use transformers and deep models
+fasttext helps us train word vectors
+this file will test the fasttext model
+openai builds powerful language models

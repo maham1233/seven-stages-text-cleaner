@@ -1,0 +1,298 @@
+import streamlit as st
+import fitz
+import fasttext
+import re
+import json
+import csv
+from hashlib import sha256
+from datasketch import MinHash, MinHashLSH
+from trafilatura import extract
+import pytesseract
+from PIL import Image
+import docx2txt
+import os
+from tqdm import tqdm
+from datetime import datetime
+
+# Configure path to tesseract executable
+pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+
+# Load language model
+@st.cache_resource
+def load_lang_model():
+    return fasttext.load_model("lid.176.bin")
+
+lang_model = load_lang_model()
+lsh_index = MinHashLSH(threshold=0.8, num_perm=128)
+seen_spans = set()
+
+UNWANTED_PATTERNS = [
+    'subscribe', 'follow us', 'click here', 'share on', 'cookie policy',
+    'advertisement', 'back to top', 'comments?', 'login', 'sign up', 'terms of service'
+]
+
+FILTER_LOGS = []
+
+# Utility functions
+
+def extract_text_from_pdf(file):
+    try:
+        bytes_data = file.read()
+        with fitz.open(stream=bytes_data, filetype="pdf") as doc:
+            extracted_pages = [page.get_text("text") for page in doc]
+            full_text = "\n".join(extracted_pages)
+            return full_text if full_text.strip() else ""
+    except Exception as e:
+        return ""
+
+def extract_text_with_ocr(file, show_previews=True):
+    try:
+        doc = fitz.open(stream=file.read(), filetype="pdf")
+        total_pages = len(doc)
+        text = ""
+        max_previews = 5
+
+        progress_text = st.empty()
+        progress_bar = st.progress(0)
+
+        all_confidences = []
+
+        for i, page in enumerate(doc):
+            progress = (i + 1) / total_pages
+            progress_bar.progress(progress)
+            progress_text.text(f"🔍 OCR Progress: Page {i + 1} of {total_pages}")
+
+            zoom = 2.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            ocr_result = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+            ocr_text = pytesseract.image_to_string(img)
+
+            confidences = [int(c) for c in ocr_result['conf'] if c != '-1']
+            if confidences:
+                avg_conf = sum(confidences) / len(confidences)
+                all_confidences.append(avg_conf)
+
+            if show_previews and i < max_previews:
+                st.text_area(f"📄 OCR Page {i + 1} Preview", ocr_text[:1500], height=200)
+                if confidences:
+                    st.caption(f"🔍 Average OCR confidence (page {i + 1}): {avg_conf:.2f}%")
+            elif show_previews and i == max_previews:
+                st.info("🔍 Preview limit reached. Continuing silently...")
+
+            text += ocr_text + "\n"
+
+        progress_bar.progress(1.0)
+        if all_confidences:
+            overall_avg = sum(all_confidences) / len(all_confidences)
+            progress_text.text(f"✅ OCR Completed. Avg confidence: {overall_avg:.2f}% over {total_pages} pages.")
+        else:
+            progress_text.text("✅ OCR Completed. Confidence data not available.")
+
+        return text
+    except Exception as e:
+        st.error(f"❌ OCR extraction failed: {e}")
+        return ""
+
+def pre_clean_pdf_text(text):
+    text = re.sub(r'\n?Page \d+\n?', ' ', text)
+    lines = text.split('\n')
+    lines = [line.strip() for line in lines if len(line.strip()) > 20]
+    joined = ' '.join(lines)
+    return re.sub(r'\s+', ' ', joined).strip()
+
+def extract_main_text(html):
+    return extract(html, include_comments=False, include_tables=False)
+
+def extract_text_from_docx(file):
+    with open("temp.docx", "wb") as f:
+        f.write(file.read())
+    text = docx2txt.process("temp.docx")
+    os.remove("temp.docx")
+    return text
+
+def extract_text_from_txt(file):
+    return file.read().decode("utf-8")
+
+def is_english(text):
+    lang, prob = lang_model.predict(text.replace('\n', ' '), k=1)
+    return lang[0] == '__label__en' and prob[0] >= 0.65
+
+def remove_bad_lines(text):
+    lines = text.split('\n')
+    filtered = [line for line in lines if any(p in line.lower() for p in UNWANTED_PATTERNS)]
+    cleaned = [line for line in lines if line not in filtered]
+    if len(cleaned) < 0.95 * len(lines):
+        print("❌ Too many bad lines removed.")
+        print(f"Original lines: {len(lines)} | Kept: {len(cleaned)} | Removed: {len(filtered)}")
+        print("Example removed line:", filtered[0] if filtered else "None")
+        return None
+    return '\n'.join(cleaned)
+
+
+def has_exact_duplicate_spans(text, seen_spans, min_tokens=50):
+    tokens = text.split()
+    for i in range(len(tokens) - min_tokens + 1):
+        span = ' '.join(tokens[i:i + min_tokens])
+        span_hash = sha256(span.encode()).hexdigest()
+        if span_hash in seen_spans:
+            return True
+        seen_spans.add(span_hash)
+    return False
+
+def get_minhash(text, num_perm=128):
+    m = MinHash(num_perm=num_perm)
+    for word in set(text.split()):
+        m.update(word.encode('utf8'))
+    return m
+
+def clean_text(text, skip_filters=False):
+    if not text:
+        FILTER_LOGS.append("🚫 Skipped: empty text")
+        return None
+    if not skip_filters and not is_english(text):
+        FILTER_LOGS.append("🚫 Skipped: not English")
+        return None
+    if not skip_filters and len(text.split()) < 50:
+        FILTER_LOGS.append("🚫 Skipped: too short (<50 words)")
+        return None
+    if not skip_filters:
+        text = remove_bad_lines(text)
+        if text is None:
+            FILTER_LOGS.append("🚫 Skipped: filtered by bad lines")
+            return None
+        if has_exact_duplicate_spans(text, seen_spans):
+            FILTER_LOGS.append("🚫 Skipped: duplicate span")
+            return None
+        m = get_minhash(text)
+        if lsh_index.query(m):
+            FILTER_LOGS.append("🚫 Skipped: duplicate LSH")
+            return None
+        lsh_index.insert(str(hash(text)), m)
+    return text
+
+def chunk_text(text, max_tokens=512):
+    words = text.split()
+    chunks = [" ".join(words[i:i+max_tokens]) for i in range(0, len(words), max_tokens)]
+    return chunks
+
+# Streamlit UI
+st.title("MDR Text Cleaner")
+st.markdown("Upload multiple HTML, PDF, DOCX, or TXT files. We'll extract and clean the content using the 7-stage MDR pipeline.")
+
+show_ocr = st.checkbox("Show OCR Previews", value=True)
+skip_filters = st.checkbox("Skip Filtering Rules (Debug Mode)", value=False)
+
+if 'stage' not in st.session_state:
+    st.session_state.stage = 'upload'
+
+if st.session_state.stage == 'upload':
+    uploaded_files = st.file_uploader("Upload files", type=["pdf", "html", "docx", "txt"], accept_multiple_files=True)
+
+    if uploaded_files:
+        st.session_state.stage = 'processed'
+        st.session_state.uploaded_files = uploaded_files
+        st.rerun()
+
+elif st.session_state.stage == 'processed':
+    st.markdown("### 📄 Uploaded Files")
+    for f in st.session_state.uploaded_files:
+        st.markdown(f"- `{f.name}`")
+    st.markdown("---")
+    uploaded_files = st.session_state.uploaded_files
+    if 'processed_files' not in st.session_state:
+        st.session_state.processed_files = {}
+        st.session_state.all_cleaned_outputs = []
+        st.session_state.all_chunks = []
+        st.session_state.metadata = []
+
+    for uploaded_file in uploaded_files:
+        st.markdown(f"### Processing: `{uploaded_file.name}`")
+        file_type = uploaded_file.name.split(".")[-1].lower()
+        raw_text = ""
+
+        if file_type == "pdf":
+            if f"{uploaded_file.name}_raw" not in st.session_state:
+                extracted = extract_text_from_pdf(uploaded_file)
+                if not extracted.strip():
+                    st.info("ℹ️ No embedded text found in PDF (e.g., scanned or image-based). Falling back to OCR extraction...")
+                    uploaded_file.seek(0)
+                    extracted = extract_text_with_ocr(uploaded_file, show_previews=show_ocr)
+                st.session_state[f"{uploaded_file.name}_raw"] = extracted
+            else:
+                extracted = st.session_state[f"{uploaded_file.name}_raw"]
+
+            st.text_area("📄 Raw Extracted Text (before cleaning)", extracted[:3000], height=300)
+            if extracted:
+                raw_text = pre_clean_pdf_text(extracted)
+
+        elif file_type == "html":
+            try:
+                html = uploaded_file.read().decode("utf-8")
+                raw_text = extract_main_text(html)
+            except Exception:
+                raw_text = ""
+
+        elif file_type == "docx":
+            raw_text = extract_text_from_docx(uploaded_file)
+
+        elif file_type == "txt":
+            raw_text = extract_text_from_txt(uploaded_file)
+
+        if raw_text:
+            cleaned = clean_text(raw_text, skip_filters=skip_filters)
+            if not cleaned:
+                st.warning(f"⚠️ File `{uploaded_file.name}` was skipped due to filtering.")
+                reason_index = len(FILTER_LOGS) - 1
+                if reason_index >= 0:
+                    reason = FILTER_LOGS[reason_index]
+                    st.info(f"Reason: {reason}")
+                    st.text_area("🔍 Sample of problematic content:", raw_text[:1000], height=200)
+            if cleaned:
+                chunks = chunk_text(cleaned)
+                st.session_state.processed_files[uploaded_file.name] = {
+                    "cleaned": cleaned,
+                    "chunks": chunks
+                }
+                st.session_state.all_cleaned_outputs.append(cleaned)
+                st.session_state.all_chunks.extend(chunks)
+
+                metadata_entry = {
+                    "filename": uploaded_file.name,
+                    "language": "en",
+                    "word_count": len(cleaned.split()),
+                    "num_chunks": len(chunks),
+                    "processed_at": datetime.now().isoformat()
+                }
+                st.session_state.metadata.append(metadata_entry)
+
+                st.subheader("Cleaned Output")
+                st.text_area("Preview", value=cleaned[:3000], height=300)
+
+    if st.session_state.all_cleaned_outputs:
+        st.markdown("---")
+        st.subheader("📁 Combined Downloads")
+        joined_text = "\n\n".join(st.session_state.all_cleaned_outputs)
+        combined_jsonl = "\n".join(json.dumps({"chunk_id": i, "content": chunk}) for i, chunk in enumerate(st.session_state.all_chunks))
+        metadata_csv = "filename,language,word_count,num_chunks,processed_at\n" + "\n".join(
+            f"{m['filename']},{m['language']},{m['word_count']},{m['num_chunks']},{m['processed_at']}" for m in st.session_state.metadata)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.download_button("⬇️ Download All Cleaned Text", joined_text, file_name="all_cleaned_text.txt")
+        with col2:
+            st.download_button("📦 Download All RAG-Ready JSONL", combined_jsonl, file_name="all_rag_chunks.jsonl")
+        with col3:
+            st.download_button("📊 Download Metadata CSV", metadata_csv, file_name="metadata_summary.csv")
+
+        if FILTER_LOGS:
+            st.subheader("🗾 Filter Logs")
+            for log in FILTER_LOGS:
+                st.code(log)
+
+        if st.button("🔄 Clean More Files"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.session_state.stage = 'upload'
+            st.rerun()
