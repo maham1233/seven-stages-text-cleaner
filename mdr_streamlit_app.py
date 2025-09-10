@@ -498,8 +498,12 @@ if uploaded and st.session_state.do_process:
                 st.error(f"{STAGE_LABELS[1]} failed: {e}")
                 if not (auto_skip_fail or ask_skip(1, file_key)): st.stop()
 
-        st.text_area("Raw extracted text (first 2k)", text[:2000], height=180)
-
+        st.text_area(
+    "Raw extracted text (first 2k)",
+    text[:2000],
+    height=180,
+    key=f"raw_preview_{file_key}",
+)
         dropped = False  # track if/where text is cleared
 
         # 2) Language ID (math/code aware)
@@ -587,7 +591,12 @@ if uploaded and st.session_state.do_process:
                 if not (auto_skip_fail or ask_skip(7, file_key)): st.stop()
 
         # Preview of cleaned text (warn explicitly if empty)
-        st.text_area("Cleaned (preview, first 2k)", (text[:2000] if text else ""), height=220)
+        st.text_area(
+    "Cleaned (preview, first 2k)",
+    (text[:2000] if text else ""),
+    height=220,
+    key=f"clean_preview_{file_key}",
+)
         if not text and not dropped:
             st.info("No cleaned text available (document may be image-only or was skipped). "
                     "Tables/OCR snippets are still exported.")
