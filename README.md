@@ -70,7 +70,7 @@ Outputs persist until you change the uploaded file set (or press **Clear results
 - **Tesseract OCR** installed  
   - Windows default: `C:\Program Files\Tesseract-OCR\tesseract.exe`  
   - Or set env var `TESSERACT_CMD` to the path.
-- (Optional) **fastText** `lid.176.bin` stored **outside** the repo  
+- **fastText** `lid.176.bin` stored **outside** the repo  
   - Set `FASTTEXT_LID_PATH` to its location.
 
 ### Python packages
@@ -140,7 +140,7 @@ Per‑file summary: filename, word_count, number of chunks/tables/figures, proce
 
 - **“fuzzy duplicate” warnings** — dedup worked; try disabling dedup stages or change files.  
 - **Tesseract not found** — install it and set `TESSERACT_CMD`.  
-- **Large file rejected by GitHub** — never commit `lid.176.bin`.
+
 
 ---
 
